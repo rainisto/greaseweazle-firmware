@@ -3,6 +3,10 @@
 ** Keir Fraser <keir.xen@gmail.com>
 ************************************
 
+** v1.2 - 18 July 2022
+ - Support AT32F403A MCU on F1 and V4 boards
+ - Send MCU info to host (reported in 'gw info')
+
 ** v1.1 - 27 February 2022
  - V4: External Activity LED can be connected to pin TXO
    - TXO-RXI jumper still forces update mode
@@ -179,7 +183,7 @@ All versions below include firmware and host tools in a combined release.
    - Weak data not yet supported (RNC "Protect Process" protection, & others)
    - Write splice is always rotated to the index (affects Speedlock & others)
    - Also TODO: Verified writes
- - USB: Use the VID:PID pair assigned to Greaseweazle (1201:4d69)
+ - USB: Use the VID:PID pair assigned to Greaseweazle (1209:4d69)
  - New prerequisite: 'bitarray' module. See the wiki.
 
 ** v0.12 - 10 March 2020

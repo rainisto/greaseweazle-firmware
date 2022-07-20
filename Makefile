@@ -1,6 +1,6 @@
 
 export FW_MAJOR := 1
-export FW_MINOR := 1
+export FW_MINOR := 2
 
 PROJ = greaseweazle-firmware
 VER := $(FW_MAJOR).$(FW_MINOR)
@@ -30,8 +30,7 @@ clean: FORCE
 	rm -rf out
 
 out: FORCE
-	mkdir -p out/$(mcu)/$(level)/$(target)
-	rsync -a --include="*/" --exclude="*" src/ out/$(mcu)/$(level)/$(target)
+	+mkdir -p out/$(mcu)/$(level)/$(target)
 
 target: FORCE out
 	$(MAKE) -C out/$(mcu)/$(level)/$(target) -f $(ROOT)/Rules.mk target.bin target.hex target.upd $(mcu)=y $(level)=y $(target)=y
