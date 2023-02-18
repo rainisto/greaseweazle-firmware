@@ -11,12 +11,12 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
 
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Set environment variables
       id: vars
       run: |
-        echo "::set-output name=ver::$(echo ${{ github.ref }} | sed -e's#.*/v##')"
+        echo "ver=$(echo ${{ github.ref }} | sed -e's#.*/v##')" >> $GITHUB_OUTPUT
 
     - name: Dependency packages (apt)
       run: |
@@ -32,7 +32,7 @@ jobs:
         mv out/*.zip .
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       with:
         name: greaseweazle-firmware.ci.${{ steps.vars.outputs.ver }}
         path: greaseweazle-firmware-${{ steps.vars.outputs.ver }}.zip
@@ -42,36 +42,27 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
 
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Set environment variables
       id: vars
       run: |
-        echo "::set-output name=ver::$(echo ${{ github.ref }} | sed -e's#.*/v##')"
+        echo "ver=$(echo ${{ github.ref }} | sed -e's#.*/v##')" >> $GITHUB_OUTPUT
 
     - name: Download artifacts
-      uses: actions/download-artifact@v2
+      uses: actions/download-artifact@v3
       with:
         name: greaseweazle-firmware.ci.${{ steps.vars.outputs.ver }}
 
     - name: Create Release
       id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      uses: ncipollo/release-action@v1
       with:
-        tag_name: ${{ github.ref }}
-        release_name: Greaseweazle Firmware ${{ steps.vars.outputs.ver }}
+        tag: ${{ github.ref }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        name: Greaseweazle Firmware ${{ steps.vars.outputs.ver }}
         body: "[**Release Notes:**](https://github.com/keirf/greaseweazle-firmware/blob/master/RELEASE_NOTES)"
         draft: false
         prerelease: false
-
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: greaseweazle-firmware-${{ steps.vars.outputs.ver }}.zip
-        asset_name: greaseweazle-firmware-${{ steps.vars.outputs.ver }}.zip
-        asset_content_type: application/zip
+        artifacts: greaseweazle-firmware-${{ steps.vars.outputs.ver }}.zip
+        artifactContentType: application/zip
