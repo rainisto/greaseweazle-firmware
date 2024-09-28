@@ -40,7 +40,7 @@
 /* CMD_READ_FLUX, length=8-12. Argument is gw_read_flux; optional fields
  * may be omitted. Returns flux readings terminating with EOStream (NUL). */
 #define CMD_READ_FLUX       7
-/* CMD_WRITE_FLUX, length=4. Argument is gw_write_flux.
+/* CMD_WRITE_FLUX, length=4-8. Argument is gw_write_flux.
  * Host follows the ACK with flux values terminating with EOStream (NUL).
  * Device finally returns a status byte, 0 on success.
  * No further commands should be issued until the status byte is received. */
@@ -205,6 +205,10 @@ struct packed gw_write_flux {
     uint8_t cue_at_index;
     /* If non-zero, terminate the write at the next index pulse. */
     uint8_t terminate_at_index;
+    /** OPTIONAL FIELDS: **/
+    /* Hard sector time, in ticks. Used to find first sector and to trigger
+     * cue_at_index and terminate_at_index, if they are enabled. */
+    uint32_t hard_sector_ticks; /* default: 0 (disabled) */
 };
 
 /* CMD_ERASE_FLUX */
@@ -221,11 +225,14 @@ struct packed gw_sink_source_bytes {
 /* CMD_{GET,SET}_PARAMS, index 0 */
 #define PARAMS_DELAYS 0
 struct packed gw_delay {
-    uint16_t select_delay; /* usec */
-    uint16_t step_delay;   /* usec */
-    uint16_t seek_settle;  /* msec */
-    uint16_t motor_delay;  /* msec */
-    uint16_t watchdog;     /* msec */
+    uint16_t select_delay; /* (usec) delay after asserting a drive select */
+    uint16_t step_delay;   /* (usec) delay after a head-step pulse */
+    uint16_t seek_settle;  /* (msec) delay after completing a seek operation */
+    uint16_t motor_delay;  /* (msec) delay after turning on a drive spindle */
+    uint16_t watchdog;     /* (msec) timeout after last command */
+    uint16_t pre_write;    /* (usec) min time since previous head change */
+    uint16_t post_write;   /* (usec) min time to next write/step/head-change */
+    uint16_t index_mask;   /* (usec) post-trigger index mask */
 };
 
 /* CMD_SWITCH_FW_MODE */

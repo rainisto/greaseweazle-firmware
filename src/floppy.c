@@ -24,8 +24,17 @@
 #define sample_us(x) ((x) * SAMPLE_MHZ)
 #define time_from_samples(x) udiv64((uint64_t)(x) * TIME_MHZ, SAMPLE_MHZ)
 
-#define write_pin(pin, level) \
-    gpio_write_pin(gpio_##pin, pin_##pin, level ? O_TRUE : O_FALSE)
+/* Track and modify states of output pins. */
+static struct {
+    bool_t dir;
+    bool_t step;
+    bool_t wgate;
+    bool_t head;
+} pins;
+#define read_pin(pin) pins.pin
+#define write_pin(pin, level) ({                                        \
+    gpio_write_pin(gpio_##pin, pin_##pin, level ? O_TRUE : O_FALSE);    \
+    pins.pin = level; })
 
 static int bus_type = -1;
 static int unit_nr = -1;
@@ -42,7 +51,10 @@ static const struct gw_delay factory_delay_params = {
     .step_delay = 10000,
     .seek_settle = 15,
     .motor_delay = 750,
-    .watchdog = 10000
+    .watchdog = 10000,
+    .pre_write = 100,
+    .post_write = 1000,
+    .index_mask = 200
 };
 
 extern uint8_t u_buf[];
@@ -60,13 +72,16 @@ static struct index {
     volatile unsigned int count;
     /* For synchronising index pulse reporting to the RDATA flux stream. */
     volatile unsigned int rdata_cnt;
-    /* Last time at which ISR fired. */
-    time_t isr_time;
+    /* Threshold and trigger for detecting a hard-sector index hole. */
+    uint32_t hard_sector_thresh; /* hole-to-hole threshold to detect index */
+    uint32_t hard_sector_trigger; /* != 0 -> trigger is primed */
+    /* Last time at which index was triggered. */
+    time_t trigger_time;
     /* Timer structure for index_timer() calls. */
     struct timer timer;
 } index;
 
-/* Timer to clean up stale index.isr_time. */
+/* Timer to clean up stale index.trigger_time. */
 #define INDEX_TIMER_PERIOD time_ms(5000)
 static void index_timer(void *unused);
 
@@ -124,6 +139,43 @@ static enum {
 
 static uint32_t u_cons, u_prod;
 #define U_MASK(x) ((x)&(U_BUF_SZ-1))
+
+static struct {
+    struct timer timer;
+    unsigned int mask;
+#define DELAY_read  (1u<<0)
+#define DELAY_write (1u<<1)
+#define DELAY_seek  (1u<<2)
+#define DELAY_head  (1u<<3)
+} op_delay;
+static void op_delay_timer(void *unused);
+
+/* Delay specified operation(s) by specified number of microseconds. */
+static void op_delay_async(unsigned int mask, unsigned int usec)
+{
+    time_t deadline;
+
+    /* Very long delays fall back to synchronous wait. */
+    if (usec > 1000000u) {
+        delay_us(usec);
+        return;
+    }
+
+    deadline = time_now() + time_us(usec);
+    timer_cancel(&op_delay.timer);
+    if ((op_delay.mask != 0) &&
+        (time_diff(op_delay.timer.deadline, deadline) < 0))
+        deadline = op_delay.timer.deadline;
+    op_delay.mask |= mask;
+    timer_set(&op_delay.timer, deadline);
+}
+
+/* Wait for specified operation(s) to be permitted. */
+static void op_delay_wait(unsigned int mask)
+{
+    while (op_delay.mask & mask)
+        cpu_relax();
+}
 
 static void drive_deselect(void)
 {
@@ -407,6 +459,8 @@ static uint8_t floppy_seek(int cyl)
         return ACK_NO_UNIT;
     u = &unit[unit_nr];
 
+    op_delay_wait(DELAY_seek);
+
     if (!u->initialised) {
         uint8_t rc = floppy_seek_initialise(u);
         if (rc != ACK_OKAY)
@@ -433,7 +487,8 @@ static uint8_t floppy_seek(int cyl)
 
     flippy_trk0_sensor_enable();
 
-    delay_ms(delay_params.seek_settle);
+    op_delay_async(DELAY_read | DELAY_write | DELAY_seek,
+                   delay_params.seek_settle * 1000u);
     u->cyl = cyl;
 
     return ACK_OKAY;
@@ -465,11 +520,25 @@ static uint8_t floppy_noclick_step(void)
     return ACK_OKAY;
 }
 
+static void index_set_hard_sector_detection(uint32_t hard_sector_ticks)
+{
+    uint32_t hard_sector_time = time_from_samples(hard_sector_ticks);
+
+    IRQ_global_disable();
+    index.hard_sector_thresh = hard_sector_time * 3 / 4;
+    index.hard_sector_trigger = 0;
+    IRQ_global_enable();
+}
+
 static void floppy_flux_end(void)
 {
     /* Turn off write pins. */
-    write_pin(wgate, FALSE);
-    configure_pin(wdata, GPO_bus);    
+    if (read_pin(wgate)) {
+        write_pin(wgate, FALSE);
+        configure_pin(wdata, GPO_bus);
+        op_delay_async(DELAY_write | DELAY_seek | DELAY_head,
+                       delay_params.post_write);
+    }
 
     /* Turn off timers. */
     tim_rdata->ccer = 0;
@@ -484,6 +553,9 @@ static void floppy_flux_end(void)
     dma_wdata.cr &= ~DMA_CR_EN;
     while ((dma_rdata.cr & DMA_CR_EN) || (dma_wdata.cr & DMA_CR_EN))
         continue;
+
+    /* Disable hard-sector index detection. */
+    index_set_hard_sector_detection(0);
 }
 
 static void quiesce_drives(void)
@@ -588,6 +660,9 @@ void floppy_init(void)
     exti->imr = exti->ftsr = m(pin_index);
     IRQx_set_prio(irq_index, INDEX_IRQ_PRI);
     IRQx_enable(irq_index);
+
+    op_delay.mask = 0;
+    timer_init(&op_delay.timer, op_delay_timer, NULL);
 
     delay_params = factory_delay_params;
 
@@ -722,6 +797,8 @@ static void rdata_encode_flux(void)
 
 static uint8_t floppy_read_prep(const struct gw_read_flux *rf)
 {
+    op_delay_wait(DELAY_read);
+
     /* Prepare Timer & DMA. */
     dma_rdata.mar = (uint32_t)(unsigned long)dma.buf;
     dma_rdata.ndtr = ARRAY_SIZE(dma.buf);    
@@ -1068,6 +1145,8 @@ static uint8_t floppy_write_prep(const struct gw_write_flux *wf)
     write.cue_at_index = wf->cue_at_index;
     write.terminate_at_index = wf->terminate_at_index;
 
+    index_set_hard_sector_detection(wf->hard_sector_ticks);
+
     return ACK_OKAY;
 }
 
@@ -1096,6 +1175,8 @@ static void floppy_write_wait_data(void)
          || ((uint32_t)(u_prod - u_cons) < u_buf_threshold))
         && !write_finished)
         return;
+
+    op_delay_wait(DELAY_write);
 
     floppy_state = ST_write_flux_wait_index;
     flux_op.start = time_now();
@@ -1215,6 +1296,8 @@ static void floppy_write_drain(void)
 
 static uint8_t floppy_erase_prep(const struct gw_erase_flux *ef)
 {
+    op_delay_wait(DELAY_write);
+
     if (get_wrprot() == LOW)
         return ACK_WRPROT;
 
@@ -1232,7 +1315,7 @@ static void floppy_erase(void)
     if (time_since(flux_op.end) < 0)
         return;
 
-    write_pin(wgate, FALSE);
+    floppy_flux_end();
 
     /* ACK with Status byte. */
     u_buf[0] = flux_op.status;
@@ -1496,7 +1579,11 @@ static void process_command(void)
         uint8_t head = u_buf[2];
         if ((len != 3) || (head > 1))
             goto bad_command;
-        write_pin(head, head);
+        if (read_pin(head) != head) {
+            op_delay_wait(DELAY_head);
+            write_pin(head, head);
+            op_delay_async(DELAY_write, delay_params.pre_write);
+        }
         break;
     }
     case CMD_SET_PARAMS: {
@@ -1536,8 +1623,9 @@ static void process_command(void)
         goto out;
     }
     case CMD_WRITE_FLUX: {
-        struct gw_write_flux wf;
-        if (len != (2 + sizeof(wf)))
+        struct gw_write_flux wf = {};
+        if ((len < (2 + offsetof(struct gw_write_flux, hard_sector_ticks)))
+            || (len > (2 + sizeof(wf))))
             goto bad_command;
         memcpy(&wf, &u_buf[2], len-2);
         u_buf[1] = floppy_write_prep(&wf);
@@ -1757,14 +1845,33 @@ const struct usb_class_ops usb_cdc_acm_ops = {
 static void IRQ_INDEX_changed(void)
 {
     unsigned int cnt = tim_rdata->cnt;
-    time_t now = time_now(), prev = index.isr_time;
+    time_t now = time_now();
+    int32_t delta;
 
     /* Clear INDEX-changed flag. */
     exti->pr = m(pin_index);
 
-    index.isr_time = now;
-    if (time_diff(prev, now) < time_us(50))
+    delta = time_diff(index.trigger_time, now);
+    if (delta < time_us(delay_params.index_mask))
         return;
+    index.trigger_time = now;
+
+    if (unlikely(index.hard_sector_thresh != 0)) {
+        if (delta > index.hard_sector_thresh) {
+            /* Long pulse indicates a subsequent sector hole. Filter it out
+             * and unprime the index trigger. */
+            index.hard_sector_trigger = 0;
+            return;
+        }
+        /* First short pulse indicates the extra (index) hole. Second
+         * consecutive short pulse is the first sector hole: That's the only
+         * one we count. */
+        index.hard_sector_trigger ^= 1;
+        if (index.hard_sector_trigger) {
+            /* Filter out the "rising edge" of the trigger. */
+            return;
+        }
+    }
 
     index.count++;
     index.rdata_cnt = cnt;
@@ -1774,15 +1881,22 @@ static void index_timer(void *unused)
 {
     time_t now = time_now();
     IRQ_global_disable();
-    /* index.isr_time mustn't get so old that the time_diff() test in
+    /* index.trigger_time mustn't get so old that the time_diff() test in
      * IRQ_INDEX_changed() overflows. To prevent this, we ensure that,
      * at all times,
-     *   time_diff(index.isr_time, time_now()) < 2*INDEX_TIMER_PERIOD + delta,
+     *   time_diff(index.trigger_time, now) < 2*INDEX_TIMER_PERIOD + delta,
      * where delta is small. */
-    if (time_diff(index.isr_time, now) > INDEX_TIMER_PERIOD)
-        index.isr_time = now - INDEX_TIMER_PERIOD;
+    if (time_diff(index.trigger_time, now) > INDEX_TIMER_PERIOD)
+        index.trigger_time = now - INDEX_TIMER_PERIOD;
     IRQ_global_enable();
     timer_set(&index.timer, now + INDEX_TIMER_PERIOD);
+}
+
+static void op_delay_timer(void *unused)
+{
+    while (time_diff(time_now(), op_delay.timer.deadline) > 0)
+        cpu_relax();
+    op_delay.mask = 0;
 }
 
 /*
